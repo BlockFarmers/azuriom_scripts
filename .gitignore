@@ -1,5 +1,6 @@
 venv/
-cmd_files/
+cms_files/
+backups/
 
 .env
 sync_grades_mc_website.sh

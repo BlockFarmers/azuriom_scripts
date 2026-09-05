@@ -52,17 +52,83 @@ websiteConn = mysql.connector.connect(
 websiteCur = websiteConn.cursor()
 
 # ============================================================
-# Fonctions utiles
+# Fonctions utiles - Lecture LuckPerms
 # ============================================================
 
 def getMcPlayers():
+    """Liste des joueurs connus de LuckPerms avec leur groupe primaire (uuid avec tirets)."""
     try:
         mcCur.execute("SELECT uuid, primary_group FROM luckperms_players")
-        players = mcCur.fetchall()
-        mcConn.close()
-        return players
+        return mcCur.fetchall()
     except Exception as e:
-        return f"Erreur (getMcPlayers) : {e}"
+        print(f"Erreur (getMcPlayers) : {e}")
+        return []
+
+def getMcAddedGroups():
+    """
+    Groupes ajoutés via '/lp user ... parent add <grade>' (nœuds 'group.<nom>'
+    dans luckperms_user_permissions), en ne gardant que les attributions actives
+    (value = 1) et non expirées. Retourne un dict {uuid: {grade1, grade2, ...}}.
+    """
+    try:
+        mcCur.execute(
+            """
+            SELECT uuid, SUBSTRING(permission, 7) AS grade
+            FROM luckperms_user_permissions
+            WHERE permission LIKE 'group.%%'
+              AND value = 1
+              AND (expiry = 0 OR expiry > UNIX_TIMESTAMP())
+            """
+        )
+        added_groups = {}
+        for uuid, grade in mcCur.fetchall():
+            added_groups.setdefault(uuid, set()).add(grade)
+        return added_groups
+    except Exception as e:
+        print(f"Erreur (getMcAddedGroups) : {e}")
+        return {}
+
+def getMcGroupWeights():
+    """
+    Poids de chaque groupe LuckPerms, tels que définis avec
+    '/lp group <grade> setweight <n>' (nœuds 'weight.<n>' dans
+    luckperms_group_permissions). Retourne un dict {grade: poids}.
+    Un groupe sans poids défini vaut 0 par défaut : pense à faire
+    un setweight sur chacun de tes grades pour un tri fiable.
+    """
+    try:
+        mcCur.execute(
+            """
+            SELECT name, permission
+            FROM luckperms_group_permissions
+            WHERE permission LIKE 'weight.%%'
+              AND value = 1
+            """
+        )
+        weights = {}
+        for name, permission in mcCur.fetchall():
+            try:
+                weights[name] = int(permission.split('.', 1)[1])
+            except (IndexError, ValueError):
+                pass
+        return weights
+    except Exception as e:
+        print(f"Erreur (getMcGroupWeights) : {e}")
+        return {}
+
+def getHighestGrade(primary_group, added_groups, weights):
+    """
+    Détermine, parmi le groupe primaire ('parent set') et les groupes
+    ajoutés ('parent add'), celui qui a le poids le plus élevé.
+    En cas d'égalité de poids, le choix est fait par ordre alphabétique
+    (comportement déterministe, à ajuster si besoin).
+    """
+    candidates = sorted(added_groups | {primary_group})
+    return max(candidates, key=lambda grade: weights.get(grade, 0))
+
+# ============================================================
+# Fonctions utiles - Site web (Azuriom)
+# ============================================================
 
 def getWebsiteUsers():
     try:
@@ -75,7 +141,8 @@ def getWebsiteUsers():
         )
         return websiteCur.fetchall()
     except Exception as e:
-        return f"Erreur (getWebsiteUsers) : {e}"
+        print(f"Erreur (getWebsiteUsers) : {e}")
+        return []
 
 def updateUser(uuid, role):
     try:
@@ -89,21 +156,39 @@ def updateUser(uuid, role):
         )
         websiteConn.commit()
     except Exception as e:
-        return f"Erreur (updateUser) : {e}"
+        print(f"Erreur (updateUser) : {e}")
 
 # ============================================================
 # Boucle principale
 # ============================================================
 
-for player in getMcPlayers():
-    player_uuid = player[0].replace('-', '') # UUID sans les -
-    player_role = player[1] if player[1] != 'default' else 'joueur' # Si le grade est "default", mettre "joueur" pour le role Azuriom
+# Toutes les lectures LuckPerms sont faites avant de fermer la connexion MC
+mc_players = getMcPlayers()
+mc_added_groups = getMcAddedGroups()
+mc_group_weights = getMcGroupWeights()
 
-    for user in getWebsiteUsers():
-        user_role = user[0].lower() # Role Azuriom en minuscules
-        user_uuid = user[1] # UUID sans les -
+mcCur.close()
+mcConn.close()
 
-        # Si l'uuid est le meme en jeu que sur Azurium mais que les roles ne correspondent pas et que le role n'est pas dans la liste des roles à ne pas synchroniser
-        if user_uuid == player_uuid and user_role != player_role and user_role not in NO_SYNC:
-            # Mettre à jour le role sur Azuriom
-            updateUser(user_uuid, player_role.upper())
+# Dictionnaire {uuid sans tirets: role Azuriom en minuscules} pour un lookup en O(1)
+website_users = {user_uuid: role.lower() for role, user_uuid in getWebsiteUsers()}
+
+for player_uuid_raw, primary_group in mc_players:
+    player_uuid = player_uuid_raw.replace('-', '') # UUID sans les -
+
+    # Grade le plus haut (poids max) parmi le groupe primaire et les groupes ajoutés
+    added_groups = mc_added_groups.get(player_uuid_raw, set())
+    highest_grade = getHighestGrade(primary_group, added_groups, mc_group_weights)
+
+    player_role = highest_grade if highest_grade != 'default' else 'joueur' # Si le grade est "default", mettre "joueur" pour le role Azuriom
+
+    user_role = website_users.get(player_uuid)
+
+    # Si le joueur a un compte Azuriom, que les roles ne correspondent pas et que
+    # le role n'est pas dans la liste des roles à ne pas synchroniser
+    if user_role is not None and user_role != player_role and user_role not in NO_SYNC:
+        # Mettre à jour le role sur Azuriom
+        updateUser(player_uuid, player_role.upper())
+
+websiteCur.close()
+websiteConn.close()
